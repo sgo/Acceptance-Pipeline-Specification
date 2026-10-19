@@ -4,7 +4,7 @@
             [clojure.string :as str])
   (:gen-class))
 
-(def usage "usage: gherkin-mutator --runner-worker <command> [--feature <path>] [--work-dir <dir>] [--generated-dir <dir>] [--workers <n>] [--timeout <duration>] [--status-interval <duration>] [--level full|hard|soft] [--implementation-hash <hash>] [--json]")
+(def usage "usage: gherkin-mutator --runner-worker <command> [--value-adapter <command>] [--feature <path>] [--work-dir <dir>] [--generated-dir <dir>] [--workers <n>] [--timeout <duration>] [--status-interval <duration>] [--level full|hard|soft] [--implementation-hash <hash>] [--json]")
 
 (defn- parse-duration-ms [text]
   (cond
@@ -24,6 +24,7 @@
                :status-interval "30s"
                :level "hard"
                :runner-worker ""
+               :value-adapter ""
                :implementation-hash nil
                :json false}]
     (if-let [arg (first args)]
@@ -36,6 +37,7 @@
         "--status-interval" (recur (nnext args) (assoc opts :status-interval (second args)))
         "--level" (recur (nnext args) (assoc opts :level (second args)))
         "--runner-worker" (recur (nnext args) (assoc opts :runner-worker (second args)))
+        "--value-adapter" (recur (nnext args) (assoc opts :value-adapter (second args)))
         "--implementation-hash" (recur (nnext args) (assoc opts :implementation-hash (second args)))
         "--json" (recur (rest args) (assoc opts :json true))
         (throw (ex-info (str "unknown option " arg) {})))
@@ -66,10 +68,11 @@
                                     :level (:level opts)
                                     :implementation-hash implementation-hash
                                     :status-interval-ms (parse-duration-ms (:status-interval opts))
-                                    :runner-command (str/split (:runner-worker opts) #"\s+")})
+                                    :runner-command (str/split (:runner-worker opts) #"\s+")
+                                    :value-adapter-command (:value-adapter opts)})
               write-stamp? (and (zero? (get-in report [:summary :Survived] 0))
                                 (zero? (get-in report [:summary :Errors] 0)))]
-          (mutation/write-mutation-metadata! (:feature opts) feature report implementation-hash (:level opts) write-stamp?)
+          (mutation/write-mutation-metadata! (:feature opts) feature report implementation-hash (:mutations report) (:level opts) write-stamp?)
           (if (:json opts)
             (mutation/write-json-report! report)
             (mutation/write-text-report! report))

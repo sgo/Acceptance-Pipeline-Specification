@@ -92,6 +92,11 @@ Options:
     Persistent runner adapter command. Required. The mutator starts worker
     processes once and sends mutation jobs over stdin/stdout.
 
+--value-adapter <command>
+    Optional persistent value-type adapter. The mutator starts one process and
+    asks it to match and mutate project-specific value formats before falling
+    back to the portable integer/float/boolean rules and string dithering.
+
 --implementation-hash <hash>
     Override the implementation hash read from
     <generated-dir>/metadata/<feature-metadata-name>.json.
@@ -297,6 +302,32 @@ The runner adapter is project-specific. It hides whether the project uses
 test mechanism.
 
 The portable mutator must not link directly to project test code.
+
+## Value Adapter
+
+The optional value adapter is the project's type registry, analogous to a
+Cucumber `TypeRegistry` / `ParameterType`. It lets a project teach the mutator
+about arbitrary formats without adding domain types to the portable mutator.
+
+The mutator starts the command once and sends one JSON object per line:
+
+```json
+{"id":"$.scenarios[0].examples[0].start","path":"$.scenarios[0].examples[0].start","value":"12:10"}
+```
+
+The adapter answers with one JSON object per line:
+
+```json
+{"id":"$.scenarios[0].examples[0].start","matched":true,"mutated":"12:11","equivalent":false,"reason":""}
+```
+
+`matched=false` means the adapter does not own this format; the mutator uses
+its portable rules. `equivalent=true` means the cell has no observable
+mutation for this format and must be skipped. A matched, non-equivalent
+mutation must be a valid value of the same type.
+
+The adapter and the step handlers must share the same parser, so a value the
+mutator considers valid is also a value the acceptance runner can execute.
 
 Runner outcomes:
 

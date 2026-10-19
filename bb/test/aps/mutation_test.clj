@@ -39,6 +39,30 @@
                "    (flush)))\n"))
     (str path)))
 
+(defn- value-adapter-script [dir]
+  (let [path (io/file dir "value-adapter.clj")]
+    (spit path
+          (str "(require '[cheshire.core :as json])\n"
+               "(doseq [line (line-seq (java.io.BufferedReader. *in*))]\n"
+               "  (let [req (json/parse-string line true)]\n"
+               "    (println (json/generate-string\n"
+               "      (case (:value req)\n"
+               "        \"20\" {:id (:id req) :matched true :mutated \"21\"}\n"
+               "        \"80\" {:id (:id req) :matched true :equivalent true}\n"
+               "        {:id (:id req) :matched false})))\n"
+               "    (flush)))\n"))
+    (str path)))
+
+(defn- succeeding-worker-script [dir]
+  (let [path (io/file dir "succeeding-worker.clj")]
+    (spit path
+          (str "(require '[cheshire.core :as json])\n"
+               "(doseq [line (line-seq (java.io.BufferedReader. *in*))]\n"
+               "  (let [req (json/parse-string line true)]\n"
+               "    (println (json/generate-string {:id (:id req) :outcome \"test_success\"}))\n"
+               "    (flush)))\n"))
+    (str path)))
+
 (deftest discovers-mutations-in-stable-example-key-order
   (let [mutations (mutation/discover mutation-feature)]
     (is (= ["m1" "m2" "m3"] (mapv :ID mutations)))
@@ -79,3 +103,21 @@
     (testing "mutation JSON files are written for the worker"
       (is (.exists (io/file dir "work" "base" "feature.json")))
       (is (.exists (io/file dir "work" "mutations" "m1" "feature.json"))))))
+
+(deftest value-adapter-owns-its-format-and-skips-equivalent-cells
+  (let [dir (.toFile (temp-dir))
+        adapter (value-adapter-script dir)
+        worker (succeeding-worker-script dir)
+        report (mutation/run {:feature mutation-feature
+                              :work-dir (str (io/file dir "work"))
+                              :workers 1
+                              :status-interval-ms 0
+                              :runner-command ["bb" worker]
+                              :value-adapter-command ["bb" adapter]})]
+    (is (= "21" (:Mutated (first (:mutations report)))))
+    (is (not= "100" (:Mutated (second (:mutations report)))))
+    (is (= 2 (get-in report [:summary :Total])))
+    (is (= 2 (get-in report [:summary :Survived])))
+    (testing "the equivalent cell is omitted"
+      (is (not-any? #(= "$.scenarios[0].examples[0].remaining" (:Path %))
+                    (:mutations report))))))

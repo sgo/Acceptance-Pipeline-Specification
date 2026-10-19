@@ -34,7 +34,7 @@
         (when (and (not (Double/isInfinite f)) (not (Double/isNaN f))) f)))
     (catch Exception _ nil)))
 
-(declare mutate-value)
+(declare mutate-value mutated-cell)
 
 (defn- dither [path value]
   (if (empty? value)
@@ -78,24 +78,28 @@
 
       :else (dither path value))))
 
-(defn discover [feature]
-  (vec
-   (map-indexed
-    (fn [i mutation] (assoc mutation :ID (str "m" (inc i))))
-    (for [[scenario-index scenario] (map-indexed vector (:scenarios feature))
-          [example-index example] (map-indexed vector (:examples scenario))
-          key (sort (keys example))
-          :let [original (get example key)
-                path (format "$.scenarios[%d].examples[%d].%s" scenario-index example-index (name key))
-                mutated (mutate-value path original)]
-          :when (not= mutated original)]
-      (array-map :Path path
-                 :Description (format "%s: %s -> %s" path original mutated)
-                 :Original original
-                 :Mutated mutated
-                 :scenario scenario-index
-                 :example example-index
-                 :key key)))))
+(defn discover
+  ([feature] (discover feature nil))
+  ([feature adapter]
+   (vec
+    (map-indexed
+     (fn [i mutation] (assoc mutation :ID (str "m" (inc i))))
+     (for [[scenario-index scenario] (map-indexed vector (:scenarios feature))
+           [example-index example] (map-indexed vector (:examples scenario))
+           key (sort (keys example))
+           :let [original (get example key)
+                 path (format "$.scenarios[%d].examples[%d].%s" scenario-index example-index (name key))
+                 adapted (mutated-cell adapter path original)
+                 mutated (:mutated adapted)]
+           :when (and (not (:equivalent adapted))
+                      (not= mutated original))]
+       (array-map :Path path
+                  :Description (format "%s: %s -> %s" path original mutated)
+                  :Original original
+                  :Mutated mutated
+                  :scenario scenario-index
+                  :example example-index
+                  :key key))))))
 
 (defn apply-mutation [feature mutation]
   (assoc-in feature [:scenarios (:scenario mutation) :examples (:example mutation) (:key mutation)]
@@ -170,6 +174,41 @@
           {:outcome "infrastructure_error"
            :error (.getMessage e)
            :duration (- (System/nanoTime) started)})))))
+
+(defn- run-value-adapter [adapter path value]
+  (locking (:lock adapter)
+    (let [request (array-map :id path :path path :value value)]
+      (try
+        (.write (:writer adapter) (json/generate-string request))
+        (.newLine (:writer adapter))
+        (.flush (:writer adapter))
+        (if-let [line (.readLine (:reader adapter))]
+          (let [response (json/parse-string line true)]
+            (if (= (:id response) path)
+              {:matched (boolean (:matched response))
+               :mutated (str (:mutated response))
+               :equivalent (boolean (:equivalent response))
+               :reason (str (:reason response))}
+              (throw (ex-info (format "value adapter response id %s does not match request id %s"
+                                      (pr-str (:id response)) (pr-str path))
+                              {:path path}))))
+          (throw (ex-info "value adapter exited without response" {:path path})))
+        (catch Exception e
+          (throw (ex-info (str "value adapter failed: " (.getMessage e)) {:path path} e)))))))
+
+(defn- command-vector [command]
+  (cond
+    (sequential? command) (vec command)
+    (string? command) (str/split command #"\s+")
+    :else (throw (ex-info "value adapter command must be a string or vector" {}))))
+
+(defn- mutated-cell [adapter path value]
+  (if adapter
+    (let [response (run-value-adapter adapter path value)]
+      (if (:matched response)
+        response
+        {:mutated (mutate-value path value) :equivalent false}))
+    {:mutated (mutate-value path value) :equivalent false}))
 
 (defn- empty-summary []
   (array-map :Total 0 :Killed 0 :Survived 0 :Errors 0))
@@ -279,9 +318,8 @@
             {}
             (:results report))))
 
-(defn- new-manifest [feature-path feature report implementation-hash]
+(defn- new-manifest [feature-path feature report implementation-hash mutations]
   (let [now (str (Instant/now))
-        all-mutations (discover feature)
         summaries (scenario-summaries feature report)]
     (array-map
      :version 1
@@ -299,7 +337,7 @@
              (array-map :index i
                         :name (:name scenario)
                         :scenario_hash (hash-json scenario)
-                        :mutation_count (mutation-count-for-scenario all-mutations i)
+                        :mutation_count (mutation-count-for-scenario mutations i)
                         :result summary
                         :tested_at now))))
        (:scenarios feature))))))
@@ -318,21 +356,20 @@
        (zero? (get-in entry [:result :Errors] 0))
        (= (:mutation_count entry) (mutation-count-for-scenario mutations (:index entry)))))
 
-(defn- merge-reusable-previous-scenarios [current previous feature level]
+(defn- merge-reusable-previous-scenarios [current previous feature level mutations]
   (let [existing (set (map :index (:scenarios current)))
-        mutations (discover feature)
         reusable (remove #(existing (:index %))
                          (filter #(manifest-entry-reusable? previous current % level feature mutations)
                                  (:scenarios previous)))]
     (update current :scenarios into reusable)))
 
-(defn write-mutation-metadata! [feature-path feature report implementation-hash level write-stamp?]
+(defn write-mutation-metadata! [feature-path feature report implementation-hash mutations level write-stamp?]
   (let [content (slurp feature-path)
         previous (read-mutation-metadata feature-path)
         cleaned (strip-mutation-metadata content)
         stamp (sha256 cleaned)
-        manifest (cond-> (new-manifest feature-path feature report implementation-hash)
-                   previous (merge-reusable-previous-scenarios (:manifest previous) feature level))
+        manifest (cond-> (new-manifest feature-path feature report implementation-hash mutations)
+                   previous (merge-reusable-previous-scenarios (:manifest previous) feature level mutations))
         manifest-json (json/generate-string manifest)
         metadata (str (when write-stamp?
                         (str "# mutation-stamp: sha256=" stamp "\n"))
@@ -355,7 +392,7 @@
                (feature-stamp-valid? (:feature-path cfg)))
         (set (range (count (get-in cfg [:feature :scenarios]))))
         (let [current (new-manifest (:feature-path cfg) (:feature cfg) {:summary (empty-summary) :results []}
-                                    (:implementation-hash cfg))]
+                                    (:implementation-hash cfg) mutations)]
           (set (map :index
                     (filter #(manifest-entry-reusable? (:manifest metadata) current % (:level cfg) (:feature cfg) mutations)
                             (get-in metadata [:manifest :scenarios]))))))
@@ -385,7 +422,9 @@
   (print (report-text report)))
 
 (defn write-json-report! [report]
-  (aps-json/write-pretty-out! (aps-json/strip-empty-keys #{:SkippedScenarios :SkippedMutations} report)))
+  (aps-json/write-pretty-out!
+   (aps-json/strip-empty-keys #{:SkippedScenarios :SkippedMutations}
+                               (dissoc report :mutations))))
 
 (defn- feature-metadata-slug [feature-path]
   (-> (reduce (fn [{:keys [s hyphen?]} ch]
@@ -420,8 +459,10 @@
                     :status-interval-ms 30000}
                    cfg)
         generated-dir (or (:generated-dir cfg) (str (io/file (:work-dir cfg) "generated")))
-        mutations (discover (:feature cfg))
-        skip (accepted-skips cfg mutations)
+        adapter (when (seq (:value-adapter-command cfg))
+                  (start-worker (command-vector (:value-adapter-command cfg))))
+        mutations (discover (:feature cfg) adapter)
+        skip (if adapter #{} (accepted-skips cfg mutations))
         executable-indexes (vec (keep-indexed (fn [i mutation] (when-not (skip (:scenario mutation)) i)) mutations))
         skipped-scenarios (count skip)
         skipped-mutations (- (count mutations) (count executable-indexes))
@@ -470,11 +511,14 @@
       (let [final-summary (cond-> @summary
                             (pos? skipped-scenarios) (assoc :SkippedScenarios skipped-scenarios)
                             (pos? skipped-mutations) (assoc :SkippedMutations skipped-mutations))
-            report (array-map :summary final-summary :results (vec (remove nil? @results)))]
+            report (array-map :summary final-summary
+                              :results (vec (remove nil? @results))
+                              :mutations mutations)]
         (binding [*out* *err*]
           (when (pos? (:status-interval-ms cfg))
             (println (status-line started final-summary @running skipped-scenarios skipped-mutations))))
         report)
       (finally
         (.shutdown executor)
-        (doseq [worker workers] (close-worker! worker))))))
+        (doseq [worker workers] (close-worker! worker))
+        (when adapter (close-worker! adapter))))))

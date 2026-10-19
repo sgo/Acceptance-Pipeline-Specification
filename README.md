@@ -65,7 +65,7 @@ Portable tools in this repository are primarily exposed as Babashka tasks:
 ```sh
 bb gherkin-parser <feature-file> <json-output>
 bb gherkin-ir-dry-checker [--include-exact] <json-ir> <report-output>
-bb gherkin-mutator --runner-worker "<command>" [options]
+bb gherkin-mutator --runner-worker "<command>" [--value-adapter "<command>"] [options]
 ```
 
 Go command binaries with the same names are maintained as fallbacks for
